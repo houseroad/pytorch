@@ -1,46 +1,64 @@
 #include "caffe2/operators/channel_backprop_stats_op.h"
+
 #include "caffe2/utils/eigen_utils.h"
 
 namespace caffe2 {
 
 template <>
-bool ChannelBackpropStatsOp<CPUContext>::RunOnDevice() {
-  const auto& X = Input(INPUT);
-  const auto& dY = Input(OUTPUT_GRAD);
-  CAFFE_ENFORCE(X.dim() >= 3 && X.dim() <= 5);
-  const int N = X.dim32(0);
-  const int C = X.dim32(1);
-  const int H = X.dim32(2);
-  const int W = X.dim() > 3 ? X.dim32(3) : 1;
-  const int D = X.dim() > 4 ? X.dim32(4) : 1;
-
-  const int sampleSize = H * W * D;
-
-  Output(SCALE_GRAD)->Resize(C);
-  Output(BIAS_GRAD)->Resize(C);
-  auto* dScale = Output(SCALE_GRAD);
-  auto* dBias = Output(BIAS_GRAD);
-
-  ConstEigenArrayMap<float> X_arr(X.data<float>(), sampleSize, N * C);
-  ConstEigenArrayMap<float> dY_arr(dY.data<float>(), sampleSize, N * C);
-  ConstEigenVectorArrayMap<float> mean_arr(Input(SAVED_MEAN).data<float>(), C);
-  ConstEigenVectorArrayMap<float> inv_stddev_arr(
-      Input(SAVED_INV_STDDEV).data<float>(), C);
-  EigenVectorArrayMap<float> dBias_arr(
-      dBias->template mutable_data<float>(), C);
-  EigenVectorArrayMap<float> dScale_arr(
-      dScale->template mutable_data<float>(), C);
-
-  dBias_arr.setZero();
-  dScale_arr.setZero();
-
-  for (int nc = 0; nc < N * C; ++nc) {
-    int c = nc % C;
-    dBias_arr(c) += dY_arr.col(nc).sum();
-    dScale_arr(c) +=
-        ((X_arr.col(nc) - mean_arr(c)) * inv_stddev_arr(c) * dY_arr.col(nc))
-            .sum();
+template <>
+bool ChannelBackpropStatsOp<CPUContext>::ChannelStatsBackwardNCHW<float>(
+    const int N,
+    const int C,
+    const int HxW,
+    const float* dY,
+    const float* X,
+    const float* mean,
+    const float* rstd,
+    float* dscale,
+    float* dbias) {
+  ConstEigenArrayMap<float> dY0_arr(dY, HxW, C);
+  ConstEigenArrayMap<float> X0_arr(X, HxW, C);
+  ConstEigenVectorArrayMap<float> mean_arr(mean, C);
+  ConstEigenVectorArrayMap<float> rstd_arr(rstd, C);
+  EigenVectorArrayMap<float> dscale_arr(dscale, C);
+  EigenVectorArrayMap<float> dbias_arr(dbias, C);
+  dscale_arr = (dY0_arr * X0_arr).colwise().sum();
+  dbias_arr = dY0_arr.colwise().sum();
+  for (int i = 1; i < N; ++i) {
+    ConstEigenArrayMap<float> dYi_arr(dY + i * C * HxW, HxW, C);
+    ConstEigenArrayMap<float> Xi_arr(X + i * C * HxW, HxW, C);
+    dscale_arr += (dYi_arr * Xi_arr).colwise().sum();
+    dbias_arr += dYi_arr.colwise().sum();
   }
+  dscale_arr = (dscale_arr - mean_arr * dbias_arr) * rstd_arr;
+  return true;
+}
+
+template <>
+template <>
+bool ChannelBackpropStatsOp<CPUContext>::ChannelStatsBackwardNHWC<float>(
+    const int N,
+    const int C,
+    const int HxW,
+    const float* dY,
+    const float* X,
+    const float* mean,
+    const float* rstd,
+    float* dscale,
+    float* dbias) {
+  ConstEigenArrayMap<float> dY_arr(dY, C, N * HxW);
+  ConstEigenArrayMap<float> X_arr(X, C, N * HxW);
+  ConstEigenVectorArrayMap<float> mean_arr(mean, C);
+  ConstEigenVectorArrayMap<float> rstd_arr(rstd, C);
+  EigenVectorArrayMap<float> dscale_arr(dscale, C);
+  EigenVectorArrayMap<float> dbias_arr(dbias, C);
+  dscale_arr = dY_arr.col(0) * X_arr.col(0);
+  dbias_arr = dY_arr.col(0);
+  for (int i = 1; i < N * HxW; ++i) {
+    dscale_arr += dY_arr.col(i) * X_arr.col(i);
+    dbias_arr += dY_arr.col(i);
+  }
+  dscale_arr = (dscale_arr - mean_arr * dbias_arr) * rstd_arr;
   return true;
 }
 
@@ -77,6 +95,7 @@ results over the larger batch size )DOC")
         "because we are on the backward pass")
     .Output(0, "scale_grad", "Gradient for the scale vector")
     .Output(1, "bias_grad", "Gradient for the bias vector");
+
 SHOULD_NOT_DO_GRADIENT(ChannelBackpropStats);
 
 } // namespace caffe2
